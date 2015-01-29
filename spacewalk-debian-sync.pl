@@ -7,12 +7,13 @@
 # supports Debian repositories
 #
 # Author:  Steve Meier
-# Version: 20130204
+# Version: 20150129
 #
 # Changelog:
 # 20130204 - Initial release
 # 20130215 - Fix for downloading security repository
 # 20130216 - Fix for downloading from snapshot.debian.org
+# 20150129 - Remote spacewalk server support
 #
 # Here are some sample URLs:
 #
@@ -36,12 +37,14 @@ use File::Basename;
 use Frontier::Client;
 use Getopt::Long;
 use WWW::Mechanize;
+use IO::Socket::SSL;
+use URI::Split qw/ uri_split uri_join /;
 
 # No buffering
 $| = 1;
 
 my $debug = 0;
-my ($getopt, $url, $channel, $username, $password, $debianroot);
+my ($getopt, $url, $channel, $username, $password, $spacewalk, $debianroot);
 my $mech;
 my ($packages, $package);
 my ($pkgname, $fileurl, $md5, $sha1, $sha256);
@@ -53,7 +56,8 @@ my %download;
 $getopt = GetOptions( 'url=s'  		=> \$url,
                       'channel=s'	=> \$channel,
 		      'username=s'	=> \$username,
-		      'password=s'	=> \$password
+		      'password=s'	=> \$password,
+		      'spacewalk=s'	=> \$spacewalk,
 		    );
 
 # Ubuntu mirrors store data under /ubuntu/
@@ -90,9 +94,22 @@ if (not(defined($debianroot))) {
   exit(1);
 }
 
+# Default spacewalk server to localhost
+if (not(defined($spacewalk))) {
+  $spacewalk = "https://localhost";
+} else {
+  #Cut down to just http(s)://server
+  my (@parts) = uri_split($spacewalk);
+  $spacewalk = uri_join(@parts[0,1]);
+}
+
 # Connect to API
-$client = new Frontier::Client(url => "http://localhost/rpc/api") ||
+$client = new Frontier::Client(url => "$spacewalk/rpc/api") ||
   die "ERROR: Could not connect to API";
+my $ua = LWP::UserAgent->new(ssl_opts => {
+    SSL_verify_mode => IO::Socket::SSL::SSL_VERIFY_NONE,
+    verify_hostname => 0,});
+$client->{'ua'} = $ua;
 
 # Authenticate to API
 $session = $client->call('auth.login', "$username", "$password");
@@ -102,7 +119,6 @@ if ($session =~ /^\w+$/) {
   &error("API Authentication FAILED!\n");
   exit 3;
 }
-
 # Index channel on server
 $allpkg = $client->call('channel.software.list_all_packages', $session, $channel);
 foreach my $pkg (@$allpkg) {
@@ -112,7 +128,6 @@ foreach my $pkg (@$allpkg) {
 
 # Logout from API
 $client->call('auth.logout', $session);
-
 # Download Packages.gz (why does this fail on some mirrors? HTTP deflate maybe?)
 $mech = WWW::Mechanize->new;
 print "INFO: Fetching Packages.gz... ";
@@ -123,7 +138,7 @@ if (not($mech->success)) {
   print "ERROR: Could not retrieve Packages.gz\n";
   exit(1);
 }
-
+&info("fetched packages");
 # Uncompress Packages.gz in memory
 $packages = Compress::Zlib::memGunzip($mech->content())
   or die "ERROR: Failed to uncompress Packages.gz\n";
@@ -134,7 +149,7 @@ $synced = 0;
 foreach $package (split(/\n\n/, $packages)) {
   foreach $_ (split(/\n/, $package)) {
     if (/^Filename: (.*)$/) { $fileurl = $1; };
-    if (/^MD5sum: (.*)$/)   { $md5     = $1; };
+    if (/^MD5Sum: (.*)$/)   { $md5     = $1; };
     if (/^SHA1: (.*)$/)     { $sha1    = $1; };
     if (/^SHA256: (.*)$/)   { $sha256  = $1; };
   }
@@ -163,7 +178,7 @@ foreach $_ (keys %download) {
  
   $mech->get("$debianroot/$download{$_}", ':content_file' => "/tmp/$_");
   if ($mech->success) {
-    system("rhnpush -c $channel -u $username -p $password /tmp/$_");
+    system("rhnpush --tolerant -c $channel -u $username -p $password --server $spacewalk /tmp/$_");
     if ($? > 0) { die "ERROR: rhnpush failed\n"; }
   }
   unlink("/tmp/$_");
